@@ -1,7 +1,16 @@
 require 'zip/filesystem'
 require 'nokogiri'
 
-module Dullard; end
+module Dullard
+  class Error < StandardError; end
+  OOXMLEpoch = DateTime.new(1899,12,30)
+  SharedStringPath = 'xl/sharedStrings.xml'
+  StylesPath = 'xl/styles.xml'
+
+  class Time < Struct.new(:hours, :minutes, :seconds)
+  end
+
+end
 
 class Dullard::Workbook
   # Code borrowed from Roo (https://github.com/hmcgowan/roo/blob/master/lib/roo/excelx.rb)
@@ -12,8 +21,8 @@ class Dullard::Workbook
     '0.00' => :float,
     '#,##0' => :float,
     '#,##0.00' => :float,
-    '0%' => :percentage,
-    '0.00%' => :percentage,
+    '0%' => :float,
+    '0.00%' => :float,
     '0.00E+00' => :float,
     '# ?/?' => :float, #??? TODO:
     '# ??/??' => :float, #??? TODO:
@@ -21,8 +30,8 @@ class Dullard::Workbook
     'd-mmm-yy' => :date,
     'd-mmm' => :date,
     'mmm-yy' => :date,
-    'h:mm am/pm' => :date,
-    'h:mm:ss am/pm' => :date,
+    'h:mm am/pm' => :time,
+    'h:mm:ss am/pm' => :time,
     'h:mm' => :time,
     'h:mm:ss' => :time,
     'm/d/yy h:mm' => :date,
@@ -80,14 +89,24 @@ class Dullard::Workbook
 
   def initialize(file, user_defined_formats = {})
     @file = file
-    @zipfs = Zip::File.open(@file)
+    begin
+      @zipfs = Zip::File.open(@file)
+    rescue Zip::Error => e
+      raise Dullard::Error, e.message
+    end
     @user_defined_formats = user_defined_formats
     read_styles
   end
 
   def sheets
-    workbook = Nokogiri::XML::Document.parse(@zipfs.file.open("xl/workbook.xml"))
-    @sheets = workbook.css("sheet").each_with_index.map {|n,i| Dullard::Sheet.new(self, n.attr("name"), n.attr("sheetId"), i+1) }
+    begin
+      workbook = Nokogiri::XML::Document.parse(@zipfs.file.open('xl/workbook.xml'))
+    rescue Zip::Error
+      raise Dullard::Error, 'Invalid file, could not open xl/workbook.xml'
+    end
+    @sheets = workbook.css('sheet').each_with_index.map do |n, i|
+      Dullard::Sheet.new(self, n.attr('name'), n.attr('sheetId'), i+1)
+    end
   end
 
   def get_sheet(sheet_name)
@@ -98,13 +117,21 @@ class Dullard::Workbook
   end
 
   def string_table
-    @string_tabe ||= read_string_table
+    @string_table ||= read_string_table
   end
 
   def read_string_table
-    @string_table = []
+    return [] unless @zipfs.file.exist? Dullard::SharedStringPath
+
+    begin
+      shared_string = @zipfs.file.open(Dullard::SharedStringPath)
+    rescue Zip::Error
+      raise Dullard::Error, 'Invalid file, could not open shared string file.'
+    end
+
     entry = ''
-    Nokogiri::XML::Reader(@zipfs.file.open("xl/sharedStrings.xml")).each do |node|
+    @string_table = []
+    Nokogiri::XML::Reader(shared_string).each do |node|
       if node.name == "si" and node.node_type == Nokogiri::XML::Reader::TYPE_ELEMENT
         entry = ''
       elsif node.name == "si" and node.node_type == Nokogiri::XML::Reader::TYPE_END_ELEMENT
@@ -117,47 +144,56 @@ class Dullard::Workbook
   end
 
   def read_styles
-    doc = Nokogiri::XML(@zipfs.file.open("xl/styles.xml"))
-
     @num_formats = {}
     @cell_xfs = []
+    return unless @zipfs.file.exist? Dullard::StylesPath
+
+    begin
+      doc = Nokogiri::XML(@zipfs.file.open(Dullard::StylesPath))
+    rescue Zip::Error
+      raise Dullard::Error, 'Invalid file, could not open styles'
+    end
 
     doc.css('/styleSheet/numFmts/numFmt').each do |numFmt|
-      numFmtId = numFmt.attributes['numFmtId'].value.to_i
-      formatCode = numFmt.attributes['formatCode'].value
-      @num_formats[numFmtId] = formatCode
+      if numFmt.attributes['numFmtId'] && numFmt.attributes['formatCode']
+        numFmtId = numFmt.attributes['numFmtId'].value.to_i
+        formatCode = numFmt.attributes['formatCode'].value
+        @num_formats[numFmtId] = formatCode
+      end
     end
 
     doc.css('/styleSheet/cellXfs/xf').each do |xf|
-      numFmtId = xf.attributes['numFmtId'].value.to_i
-      @cell_xfs << numFmtId
+      if xf.attributes['numFmtId']
+        numFmtId = xf.attributes['numFmtId'].value.to_i
+        @cell_xfs << numFmtId
+      end
     end
   end
 
 
   # Code borrowed from Roo (https://github.com/hmcgowan/roo/blob/master/lib/roo/excelx.rb)
   # convert internal excelx attribute to a format
-  def attribute2format(s)
-    id = @cell_xfs[s.to_i].to_i
-    result = @num_formats[id]
-
-    if result == nil
-      if STANDARD_FORMATS.has_key? id
-        result = STANDARD_FORMATS[id]
-      end
-    end
-
-    result.downcase
-  end
-
-  # Code borrowed from Roo (https://github.com/hmcgowan/roo/blob/master/lib/roo/excelx.rb)
-  def format2type(format)
-    if FORMATS.has_key? format
-      FORMATS[format]
-    elsif @user_defined_formats.has_key? format
-      @user_defined_formats[format]
+  def attribute_to_type(t, s)
+    if t == 's'
+      :shared
+    elsif t == 'b'
+      :boolean
     else
-      :float
+      id = @cell_xfs[s.to_i].to_i
+      result = @num_formats[id]
+
+      if result == nil
+        if STANDARD_FORMATS.has_key? id
+          result = STANDARD_FORMATS[id]
+        end
+      end
+      format = result.downcase.sub('\\', '')
+
+      if @user_defined_formats.has_key? format
+        @user_defined_formats[format]
+      else
+        FORMATS[format] || :float
+      end
     end
   end
 
@@ -177,11 +213,15 @@ class Dullard::Sheet
     @name = name
     @id = id
     @index = index
-    @file = @workbook.zipfs.file.open(path) if @workbook.zipfs.file.exist?(path)
+    begin
+      @file = @workbook.zipfs.file.open(path) if @workbook.zipfs.file.exist?(path)
+    rescue Zip::Error => e
+      raise Dullard::Error, "Couldn't open sheet #{index}: #{e.message}"
+    end
   end
 
   def string_lookup(i)
-    @workbook.string_table[i]
+    @workbook.string_table[i] || (raise Dullard::Error, 'File invalid, invalid string table.')
   end
 
   def rows
@@ -190,6 +230,7 @@ class Dullard::Sheet
       @file.rewind
       shared = false
       row = nil
+      cell_map = nil # Map of column letter to cell value for a row
       column = nil
       cell_type = nil
       closed = true
@@ -198,85 +239,73 @@ class Dullard::Sheet
         when Nokogiri::XML::Reader::TYPE_ELEMENT
           case node.name
           when "row"
-            row = []
-            column = 0
+            cell_map = {}
             next
-          when "c"
-            unless closed
-              row << ""
-              cell_type = nil
+          when 'c'
+            node_type = node.attributes['t']
+            node_style = node.attributes['s']
+            cell_index = node.attributes['r']
+            if !cell_index
+              raise Dullard::Error, 'Invalid spreadsheet XML.'
             end
-            closed = false
-
-            if node.attributes['t'] != 's' && node.attributes['t'] != 'b'
-              cell_format_index = node.attributes['s'].to_i
-              cell_type = @workbook.format2type(@workbook.attribute2format(cell_format_index))
-            end
-
-            cell_type = :boolean if node.attributes['t'] == 'b'
-            cell_type = :string if node.attributes['t'] == 'inlineStr'
-
-            rcolumn = node.attributes["r"]
-            if rcolumn
-              rcolumn.delete!("0-9")
-              while column < self.class.column_names.size and rcolumn != self.class.column_names[column]
-                row << nil
-                column += 1
-              end
-            end
-            shared = (node.attribute("t") == "s")
-            column += 1
+            column = cell_index.delete('0-9')
+            cell_type = @workbook.attribute_to_type(node_type, node_style)
+            shared = (node_type == 's')
             next
           when "is"
             cell_type = :string
             next
           end
         when Nokogiri::XML::Reader::TYPE_END_ELEMENT
-          if node.name == "sheetData"
-            break
+          if node.name == 'row'
+            y << process_row(cell_map)
           end
-          if node.name == "row"
-            unless closed
-              row << ""
-              cell_type = nil
-            end
-            closed = true
-            y << row
-            next
-          end
+          next
         end
-        value = node.value
 
-        if value
-          case cell_type
-            when :datetime
-            when :time
-            when :date
-              value = (DateTime.new(1899,12,30) + value.to_f)
-            when :percentage # ? TODO
-            when :float
-              value = convert(value.to_f)
+        if node.value
+          value = case cell_type
+            when :shared
+              string_lookup(node.value.to_i)
             when :boolean
-              value = (value.to_i == 1) ? "TRUE" : "FALSE"
+              node.value.to_i != 0
+            when :datetime, :date
+              Dullard::OOXMLEpoch + node.value.to_f
+            when :time
+              parse_time(node.value.to_f)
+            when :float
+              node.value.to_f
             else
               # leave as string
-          end
-          cell_type = nil
-
-          row << (shared ? string_lookup(value.to_i) : value)
-          closed = true
+              node.value
+            end
+          cell_map[column] = value
         end
       end
     end
   end
 
-  def convert x
-    Float(x)
-    i, f = x.to_i, x.to_f
-    i == f ? i : f
-  rescue ArgumentError
-    x
+  def parse_time(float)
+    hours = (float * 24).floor
+    minutes = (float * 24 * 60).floor % 60
+    seconds = (float * 24 * 60 * 60).floor % 60
+    Dullard::Time.new(hours, minutes, seconds)
   end
+
+  def process_row(cell_map)
+    max = cell_map.keys.map {|c| self.class.column_name_to_index c }.max
+    row = []
+    self.class.column_names[0..max].each do |col|
+      if self.class.column_name_to_index(col) > max
+        break
+      else
+        row << cell_map[col]
+      end
+    end
+    row
+  end
+
+
 
   # Returns A to ZZZ.
   def self.column_names
@@ -293,6 +322,16 @@ class Dullard::Sheet
     end
   end
 
+  def self.column_name_to_index(name)
+    if not @column_names_to_indices
+      @column_names_to_indices = {}
+      self.column_names.each_with_index do |name, i|
+        @column_names_to_indices[name] = i
+      end
+    end
+    @column_names_to_indices[name]
+  end
+
   def row_count
     if defined? @row_count
       @row_count
@@ -301,11 +340,11 @@ class Dullard::Sheet
       Nokogiri::XML::Reader(@file).each do |node|
         if node.node_type == Nokogiri::XML::Reader::TYPE_ELEMENT
           case node.name
-          when "dimension"
+          when 'dimension'
             if ref = node.attributes["ref"]
               break @row_count = ref.scan(/\d+$/).first.to_i
             end
-          when "sheetData"
+          when 'sheetData'
             break @row_count = nil
           end
         end
